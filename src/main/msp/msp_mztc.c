@@ -131,6 +131,17 @@ mspResult_e mspMztcProcessCommand(mspPacket_t *cmd, mspPacket_t *reply)
             cfgMutable->bad_pixel_removal = config->bad_pixel_removal;
             cfgMutable->vignetting_correction = config->vignetting_correction;
 
+            // Send updated configuration to camera if connected
+            if (mztcIsConnected()) {
+                // Send brightness
+                mztcSetImageParams(config->brightness, config->contrast, config->digital_enhancement);
+                // Send palette
+                mztcSetPalette(config->palette_mode);
+                // Send zoom
+                mztcSetZoom(config->zoom_level);
+                // Note: Other settings will be sent by their respective functions
+            }
+
             return MSP_RESULT_ACK;
         }
 

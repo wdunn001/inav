@@ -15,6 +15,17 @@
  * along with INAV.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/*
+ * MassZero Thermal Camera (MZTC) Driver
+ * 
+ * IMPORTANT: The thermal camera does NOT maintain configuration through
+ * power cycles. The driver automatically handles this by:
+ * 1. Detecting when the camera comes online (first successful response)
+ * 2. Sending full configuration when camera is detected
+ * 3. Monitoring for disconnections (timeout on responses)
+ * 4. Reconfiguring when camera reconnects after power loss
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -71,17 +82,25 @@
 #define MZTC_DEFAULT_VIGNETTING_CORRECTION 1
 
 // Serial packet structure for thermal camera communication
+// Note: This structure is for reference/documentation only.
+// Actual packet construction uses mztcBuildPacket() function.
 typedef struct {
-    uint8_t begin;          // 0xF0 - Start byte
+    uint8_t begin;          // MZTC_PACKET_BEGIN (0xF0) - Start byte
     uint8_t size;           // N+4 (total packet length)
-    uint8_t device_addr;    // 0x36 - Device address
+    uint8_t device_addr;    // MZTC_DEVICE_ADDRESS (0x36) - Device address
     uint8_t class_cmd;      // Class command address
     uint8_t subclass_cmd;   // Subclass command address
     uint8_t flags;          // Read/Write flags
-    uint8_t data[14];       // Data content (max 14 bytes)
+    uint8_t data[MZTC_MAX_DATA_LENGTH];  // Data content (max 14 bytes)
     uint8_t checksum;       // Checksum
-    uint8_t end;            // 0xFF - End byte
+    uint8_t end;            // MZTC_PACKET_END (0xFF) - End byte
 } mztcPacket_t;
+
+// Packet constants
+#define MZTC_PACKET_BEGIN        0xF0
+#define MZTC_PACKET_END          0xFF
+#define MZTC_DEVICE_ADDRESS      0x36
+#define MZTC_MAX_DATA_LENGTH     14
 
 // Flag definitions
 #define MZTC_FLAG_WRITE      0x00
@@ -162,6 +181,11 @@ static void mztcUpdateStatus(void);
 static void mztcCheckCalibration(void);
 static void mztcSendConfiguration(void); // Forward declaration for new function
 
+// Packet utility functions
+static uint8_t mztcCalculateChecksum(uint8_t class_cmd, uint8_t subclass_cmd, uint8_t flags, const uint8_t *data, uint8_t data_len);
+static uint8_t mztcBuildPacket(uint8_t *buffer, uint8_t class_cmd, uint8_t subclass_cmd, uint8_t flags, const uint8_t *data, uint8_t data_len);
+static bool mztcValidatePacket(const uint8_t *data, uint8_t len, uint8_t *calc_checksum);
+
 // Initialize MassZero Thermal Camera
 void mztcInit(void)
 {
@@ -180,6 +204,8 @@ void mztcInit(void)
     mztcStatus.last_frame_time = 0;
     mztcStatus.frame_count = 0;
     mztcStatus.connected = false;  // Explicitly set to false
+    mztcStatus.camera_temperature = 25.0f;  // Default room temperature
+    mztcStatus.ambient_temperature = 25.0f;  // Default room temperature
 
     // Check if enabled
     if (!mztcConfig()->enabled) {
@@ -231,22 +257,35 @@ void mztcUpdate(timeUs_t currentTimeUs)
                                            SERIAL_NOT_INVERTED);
             
             if (mztcSerialPort != NULL) {
-                // Successfully opened port
-                mztcStatus.connected = true;
-                mztcStatus.status = MZTC_STATUS_READY;
+                // Successfully opened port - but NOT connected yet!
+                // Connection will be established when camera responds
+                mztcStatus.connected = false;  // Keep false until camera responds
+                mztcStatus.status = MZTC_STATUS_OFFLINE;
                 mztcStatus.error_flags = 0;
                 mztcStatus.last_frame_time = now;
                 mztcStatus.frame_count = 0;
                 
-                // Send initial configuration commands
-                SD(fprintf(stderr, "[MZTC]: Sending initial configuration...\n"));
-                mztcSendConfiguration();
+                // Wait a bit for camera to be ready after port open
+                delay(100);  // 100ms delay
                 
-                // Log successful connection
+                // First, check if camera is present by reading init status
+                // According to documentation: Class=0x7C, Subclass=0x14, Flags=0x00 (WRITE), Data=0x00
+                SD(fprintf(stderr, "[MZTC]: Checking camera presence...\n"));
+                uint8_t init_data = 0x00;
+                if (mztcSendPacket(0x7C, 0x14, MZTC_FLAG_WRITE, &init_data, 1)) {
+                    SD(fprintf(stderr, "[MZTC]: Sent init status request, waiting for response...\n"));
+                }
+                
+                // Note: We don't wait for response here - configuration will be sent
+                // when we receive the first successful response in mztcProcessResponse()
+                // This handles the case where the camera needs time to boot up
+                
+                // Log port opening
                 if (mztcSitlMode) {
-                    SD(fprintf(stderr, "[MZTC]: Connected via SITL TCP bridge on Serial %d\n", mztcConfig()->port));
+                    SD(fprintf(stderr, "[MZTC]: Opened SITL TCP bridge on Serial %d, waiting for camera response...\n", mztcConfig()->port));
                 } else {
-                    SD(fprintf(stderr, "[MZTC]: Connected to thermal camera on Serial %d\n", mztcConfig()->port));
+                    SD(fprintf(stderr, "[MZTC]: Opened Serial %d at %d baud, waiting for camera response...\n", 
+                        mztcConfig()->port, baudRates[mztcConfig()->baudrate]));
                 }
             } else {
                 // Failed to open port
@@ -263,11 +302,30 @@ void mztcUpdate(timeUs_t currentTimeUs)
         return;
     }
 
+    // Check for timeout - camera may have lost power
+    if (mztcStatus.connected && (now - mztcLastDataReceived) > 5000) {  // 5 second timeout
+        SD(fprintf(stderr, "[MZTC]: Camera timeout - marking as disconnected\n"));
+        mztcStatus.connected = false;
+        mztcStatus.status = MZTC_STATUS_OFFLINE;
+        mztcStatus.error_flags |= MZTC_ERROR_COMMUNICATION;
+        // Will retry connection and reconfigure on next update
+    }
+    
     // Update status
     mztcUpdateStatus();
 
     // Check calibration timing
     mztcCheckCalibration();
+    
+    // Send periodic keepalive/status check to detect disconnections
+    static uint32_t lastKeepAlive = 0;
+    if (mztcStatus.connected && (now - lastKeepAlive) > 2000) {  // Every 2 seconds
+        // Send init status command to check if camera is still responding
+        // According to documentation: Class=0x7C, Subclass=0x14, Flags=0x00 (WRITE), Data=0x00
+        uint8_t init_data = 0x00;
+        mztcSendPacket(0x7C, 0x14, MZTC_FLAG_WRITE, &init_data, 1);
+        lastKeepAlive = now;
+    }
 
     // Process camera data based on mode
     switch (mztcConfig()->mode) {
@@ -450,8 +508,12 @@ static void mztcSerialReceiveCallback(uint16_t c, void *rxCallbackData)
     UNUSED(rxCallbackData);
 
     mztcLastDataReceived = millis();
+    
+    // Debug log every received byte
+    SD(fprintf(stderr, "[MZTC_RX]: %02X ", c));
 
-    if (c == 0xF0) {
+    // Detect packet start (BEGIN byte)
+    if (c == MZTC_PACKET_BEGIN) {
         mztcRxBufferIndex = 0;
         mztcRxBuffer[mztcRxBufferIndex++] = c;
         return;
@@ -461,22 +523,16 @@ static void mztcSerialReceiveCallback(uint16_t c, void *rxCallbackData)
         mztcRxBuffer[mztcRxBufferIndex++] = c;
 
         // Minimum packet: begin,size,addr,class,subclass,flags,checksum,end => 8 bytes
-        if (mztcRxBufferIndex >= 8 && c == 0xFF) {
+        // Check for packet end (END byte)
+        if (mztcRxBufferIndex >= 8 && c == MZTC_PACKET_END) {
             const uint8_t *buf = mztcRxBuffer;
-            uint8_t declaredSize = buf[1]; // N+4 total length excluding begin/end
-            uint16_t totalLen = declaredSize + 4; // matches sender usage
             
-            // Verify total length matches received length
-            if (mztcRxBufferIndex == totalLen && buf[0] == 0xF0 && buf[mztcRxBufferIndex - 1] == 0xFF) {
-                // Verify checksum
-                uint8_t calc = buf[2] + buf[3] + buf[4] + buf[5];
-                for (uint16_t i = 0; i < (uint16_t)(declaredSize - 4); i++) {
-                    calc += buf[6 + i];
-                }
-                uint8_t recvCks = buf[mztcRxBufferIndex - 2];
-                if (calc == recvCks) {
-                    mztcProcessResponse(buf, mztcRxBufferIndex);
-                }
+            // Validate packet structure and checksum using reusable function
+            uint8_t calc_checksum;
+            if (mztcValidatePacket(buf, mztcRxBufferIndex, &calc_checksum)) {
+                mztcProcessResponse(buf, mztcRxBufferIndex);
+            } else {
+                SD(fprintf(stderr, "[MZTC]: Invalid packet (checksum mismatch or structure error)\n"));
             }
             mztcRxBufferIndex = 0;
         }
@@ -494,60 +550,210 @@ static bool mztcSendPacket(uint8_t class_cmd, uint8_t subclass_cmd, uint8_t flag
     }
     
     // Validate data length to prevent buffer overflow
-    if (data_len > sizeof(((mztcPacket_t *)0)->data)) {
+    if (data_len > MZTC_MAX_DATA_LENGTH) {
         return false;
     }
 
-    mztcPacket_t packet;
-    packet.begin = 0xF0;
-    packet.device_addr = 0x36;
-    packet.class_cmd = class_cmd;
-    packet.subclass_cmd = subclass_cmd;
-    packet.flags = flags;
-
-    // Copy data
-    if (data && data_len > 0) {
-        memcpy(packet.data, data, data_len);
+    // Build packet using reusable function
+    uint8_t txBuffer[32];  // Max packet size
+    uint8_t packet_len = mztcBuildPacket(txBuffer, class_cmd, subclass_cmd, flags, data, data_len);
+    
+    if (packet_len == 0) {
+        return false;
     }
     
-    // Calculate checksum over addr, class, subclass, flags and data
-    uint8_t checksum = packet.device_addr + packet.class_cmd + packet.subclass_cmd + packet.flags;
-    for (uint8_t i = 0; i < data_len; i++) {
-        checksum += packet.data[i];
-    }
-    packet.checksum = checksum;
-    packet.end = 0xFF;
-
-    // Size field is N+4 per protocol (addr..data..checksum), where N = 3(command bytes)+1(flags)+data_len
-    packet.size = (uint8_t)(4 + 3 + 1 + data_len);
-
-    // Total bytes on wire = 1(begin) + 1(size) + (size) + 1(end)
-    const uint8_t totalLen = (uint8_t)(1 + 1 + packet.size + 1);
-    serialWriteBufShim(mztcSerialPort, (const uint8_t *)&packet, totalLen);
+    // Send the packet
+    serialWriteBufShim(mztcSerialPort, txBuffer, packet_len);
     
-    // Debug log
-    SD(fprintf(stderr, "[MZTC]: Sent packet - cmd:0x%02X/0x%02X size:%u\n", class_cmd, subclass_cmd, totalLen));
+    // Debug log with hex dump
+    SD(fprintf(stderr, "[MZTC]: Sent packet - cmd:0x%02X/0x%02X total:%u bytes: ", class_cmd, subclass_cmd, packet_len));
+    SD(for(uint8_t i = 0; i < packet_len; i++) fprintf(stderr, "%02X ", txBuffer[i]));
+    SD(fprintf(stderr, "\n"));
     
     return true;
+}
+
+// Calculate checksum for thermal camera packet
+// Checksum = Device address + class command + subclass command + flags + DATA
+static uint8_t mztcCalculateChecksum(uint8_t class_cmd, uint8_t subclass_cmd, uint8_t flags, const uint8_t *data, uint8_t data_len)
+{
+    uint8_t checksum = MZTC_DEVICE_ADDRESS + class_cmd + subclass_cmd + flags;
+    
+    if (data && data_len > 0) {
+        for (uint8_t i = 0; i < data_len; i++) {
+            checksum += data[i];
+        }
+    }
+    
+    return checksum;
+}
+
+// Build a complete thermal camera packet
+// Returns: packet length (0 on error)
+static uint8_t mztcBuildPacket(uint8_t *buffer, uint8_t class_cmd, uint8_t subclass_cmd, uint8_t flags, const uint8_t *data, uint8_t data_len)
+{
+    if (!buffer) {
+        return 0;
+    }
+    
+    // Validate data length
+    if (data_len > MZTC_MAX_DATA_LENGTH) {
+        return 0;
+    }
+    
+    uint8_t index = 0;
+    
+    // Packet structure according to documentation:
+    // BEGIN (0xF0) - Location 1
+    buffer[index++] = MZTC_PACKET_BEGIN;
+    
+    // SIZE (N+4) - Location 2
+    // N = number of data bytes, +4 = device_addr + class + subclass + flags
+    buffer[index++] = (uint8_t)(data_len + 4);
+    
+    // Device Address (0x36) - Location 3
+    buffer[index++] = MZTC_DEVICE_ADDRESS;
+    
+    // Class command address - Location 4
+    buffer[index++] = class_cmd;
+    
+    // Subclass command address - Location 5
+    buffer[index++] = subclass_cmd;
+    
+    // Flags - Location 6
+    buffer[index++] = flags;
+    
+    // DATA (Data content) - Location 7 to (N+6)
+    if (data && data_len > 0) {
+        memcpy(&buffer[index], data, data_len);
+        index += data_len;
+    }
+    
+    // CHK (Checksum) - Location (N+7)
+    buffer[index++] = mztcCalculateChecksum(class_cmd, subclass_cmd, flags, data, data_len);
+    
+    // END (0xFF) - Location (N+8)
+    buffer[index++] = MZTC_PACKET_END;
+    
+    return index;
+}
+
+// Validate received packet structure and checksum
+// Returns: true if packet is valid, false otherwise
+// calc_checksum: output parameter for calculated checksum (can be NULL)
+static bool mztcValidatePacket(const uint8_t *data, uint8_t len, uint8_t *calc_checksum)
+{
+    if (!data || len < 8) {
+        return false;
+    }
+    
+    // Check BEGIN byte (Location 1)
+    if (data[0] != MZTC_PACKET_BEGIN) {
+        return false;
+    }
+    
+    // Check END byte (Location N+8)
+    if (data[len - 1] != MZTC_PACKET_END) {
+        return false;
+    }
+    
+    // Check device address (Location 3)
+    if (data[2] != MZTC_DEVICE_ADDRESS) {
+        return false;
+    }
+    
+    // Verify packet length matches declared size
+    uint8_t declaredSize = data[1]; // SIZE field (N+4)
+    uint16_t expectedLen = declaredSize + 4; // +4 for BEGIN, SIZE, CHK, END
+    
+    if (len != expectedLen) {
+        return false;
+    }
+    
+    // Extract packet fields for checksum calculation
+    uint8_t class_cmd = data[3];      // Location 4
+    uint8_t subclass_cmd = data[4];   // Location 5
+    uint8_t flags = data[5];          // Location 6
+    uint8_t data_len = declaredSize - 4; // N = SIZE - 4
+    
+    // Calculate checksum
+    const uint8_t *packet_data = (data_len > 0) ? &data[6] : NULL;
+    uint8_t calculated_checksum = mztcCalculateChecksum(class_cmd, subclass_cmd, flags, packet_data, data_len);
+    
+    // Store calculated checksum if output parameter provided
+    if (calc_checksum) {
+        *calc_checksum = calculated_checksum;
+    }
+    
+    // Verify checksum (Location N+7, which is len-2)
+    uint8_t received_checksum = data[len - 2];
+    
+    return (calculated_checksum == received_checksum);
 }
 
 // Process response from thermal camera
 static bool mztcProcessResponse(const uint8_t *data, uint8_t len)
 {
-    if (len < 8 || data[0] != 0xF0 || data[len-1] != 0xFF) {
+    // Validate packet structure (checksum already verified in receive callback)
+    if (!mztcValidatePacket(data, len, NULL)) {
         return false;
     }
 
-    // Check device address
-    if (data[2] != 0x36) {
-        return false;
-    }
-
+    // Debug log received packet
+    SD(fprintf(stderr, "[MZTC]: Received packet - class:0x%02X/0x%02X flags:0x%02X len:%u: ", 
+        data[3], data[4], data[5], len));
+    SD(for(uint8_t i = 0; i < len; i++) fprintf(stderr, "%02X ", data[i]));
+    SD(fprintf(stderr, "\n"));
+    
     // Check flags
     uint8_t flags = data[5];
+    uint8_t class_cmd = data[3];
+    uint8_t subclass_cmd = data[4];
+    
+    // Handle init status response (special case: returns 0x7D/0x06 instead of 0x7C/0x14)
+    if (class_cmd == 0x7D && subclass_cmd == 0x06 && flags == MZTC_FLAG_SUCCESS && len > 6) {
+        uint8_t init_status = data[6];
+        SD(fprintf(stderr, "[MZTC]: Init status response: %s (0x%02X)\n", 
+            init_status == 0x01 ? "Image Output" : "Logo Loading", init_status));
+        
+        if (init_status == 0x01) {
+            // Camera is ready (Image output stage)
+            mztcStatus.error_flags &= ~MZTC_ERROR_COMMUNICATION;
+            
+            // Mark as connected when we receive first successful response
+            if (!mztcStatus.connected) {
+                mztcStatus.connected = true;
+                mztcStatus.status = MZTC_STATUS_READY;
+                SD(fprintf(stderr, "[MZTC]: Camera responded successfully - now connected\n"));
+                
+                // Camera just came online - send full configuration
+                // The camera doesn't maintain state through power cycles!
+                SD(fprintf(stderr, "[MZTC]: Sending configuration to newly connected camera...\n"));
+                mztcSendConfiguration();
+            }
+        } else {
+            // Camera still initializing (Logo loading stage)
+            mztcStatus.status = MZTC_STATUS_INITIALIZING;
+            SD(fprintf(stderr, "[MZTC]: Camera still initializing (Logo stage)\n"));
+        }
+        return true;
+    }
+    
     if (flags == MZTC_FLAG_SUCCESS) {
         // Command executed successfully
         mztcStatus.error_flags &= ~MZTC_ERROR_COMMUNICATION;
+        
+        // Mark as connected when we receive first successful response
+        if (!mztcStatus.connected) {
+            mztcStatus.connected = true;
+            mztcStatus.status = MZTC_STATUS_READY;
+            SD(fprintf(stderr, "[MZTC]: Camera responded successfully - now connected\n"));
+            
+            // Camera just came online - send full configuration
+            // The camera doesn't maintain state through power cycles!
+            SD(fprintf(stderr, "[MZTC]: Sending configuration to newly connected camera...\n"));
+            mztcSendConfiguration();
+        }
     } else if (flags == MZTC_FLAG_ERROR) {
         // Handle error
         mztcStatus.error_flags |= MZTC_ERROR_COMMUNICATION;
@@ -611,12 +817,13 @@ static void mztcCheckCalibration(void)
 // Send initial configuration commands to the camera
 static void mztcSendConfiguration(void)
 {
-    if (!mztcIsEnabled() || !mztcIsConnected()) {
+    if (!mztcIsEnabled()) {
         return;
     }
 
-    // Send auto shutter command
-    if (mztcSendPacket(0x7C, 0x04, MZTC_FLAG_WRITE, &mztcConfig()->auto_shutter, 1)) {
+    // Send auto shutter command (add 1 to match camera's expected values)
+    uint8_t shutter_value = mztcConfig()->auto_shutter + 1;  // Camera expects 1-3, not 0-2
+    if (mztcSendPacket(0x7C, 0x04, MZTC_FLAG_WRITE, &shutter_value, 1)) {
         // Send digital enhancement command
         mztcSendPacket(0x78, 0x10, MZTC_FLAG_WRITE, &mztcConfig()->digital_enhancement, 1);
         // Send spatial denoising command
@@ -792,9 +999,13 @@ bool mztcGetInitStatus(void)
         return false;
     }
 
-    // Send read command for initialization status
-    if (mztcSendPacket(0x7C, 0x14, MZTC_FLAG_READ, NULL, 0)) {
+    // Send init status command according to documentation:
+    // Class=0x7C, Subclass=0x14, Flags=0x00 (WRITE), Data=0x00
+    // Note: Response comes back as Class=0x7D, Subclass=0x06 (different addresses!)
+    uint8_t init_data = 0x00;
+    if (mztcSendPacket(0x7C, 0x14, MZTC_FLAG_WRITE, &init_data, 1)) {
         // The response will be processed in mztcProcessResponse
+        // Response format: Class=0x7D, Subclass=0x06, Flags=0x03, Data=0x00 (Logo) or 0x01 (Output)
         // Return true if command was sent successfully
         return true;
     }
@@ -802,16 +1013,19 @@ bool mztcGetInitStatus(void)
     return false;
 }
 
-// Save camera configuration to flash
+// Save camera configuration to flash (if supported by camera)
+// Note: Most thermal cameras don't maintain settings through power cycles
+// This command may not have any effect on some camera models
 bool mztcSaveConfiguration(void)
 {
     if (!mztcIsEnabled() || !mztcIsConnected()) {
         return false;
     }
 
-    // Send save configuration command
+    // Send save configuration command (0x74/0x10)
+    // This may or may not actually save to camera's non-volatile memory
     if (mztcSendPacket(0x74, 0x10, MZTC_FLAG_WRITE, NULL, 0)) {
-        SD(fprintf(stderr, "[MZTC]: Configuration saved to camera flash\n"));
+        SD(fprintf(stderr, "[MZTC]: Sent save configuration command to camera\n"));
         return true;
     }
 
@@ -844,6 +1058,17 @@ bool mztcRestoreDefaults(void)
     }
 
     return false;
+}
+
+// Debug/test function for sending raw commands
+bool mztcSendRawCommand(uint8_t class_cmd, uint8_t subclass_cmd, uint8_t flags, const uint8_t *data, uint8_t data_len)
+{
+    if (!mztcIsEnabled()) {
+        return false;
+    }
+    
+    // Send the packet (don't require connection for testing)
+    return mztcSendPacket(class_cmd, subclass_cmd, flags, data, data_len);
 }
 
 #endif // USE_MZTC

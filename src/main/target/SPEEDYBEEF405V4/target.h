@@ -152,6 +152,9 @@
 #define USE_LED_STRIP
 #define WS2811_PIN PA8
 
+// *************** MassZero Thermal Camera *****************************
+#define USE_MZTC
+
 #define DEFAULT_FEATURES                (FEATURE_TX_PROF_SEL  | FEATURE_OSD | FEATURE_CURRENT_METER | FEATURE_VBAT  | FEATURE_BLACKBOX | FEATURE_TELEMETRY)
 #define CURRENT_METER_SCALE     400
 

@@ -55,4 +55,7 @@ bool mztcGetInitStatus(void);
 bool mztcSaveConfiguration(void);
 bool mztcRestoreDefaults(void);
 
+// Debug/test function for sending raw commands
+bool mztcSendRawCommand(uint8_t class_cmd, uint8_t subclass_cmd, uint8_t flags, const uint8_t *data, uint8_t data_len);
+
 #endif // USE_MZTC

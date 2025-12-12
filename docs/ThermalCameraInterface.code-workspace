@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "../../dev/ThermalCameraInterface"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../betaflight"
+		},
+		{
+			"path": "C:/Users/willi/ardupilot"
+		},
+		{
+			"path": "../../inav-configurator"
+		}
+	],
+	"settings": {}
+}
