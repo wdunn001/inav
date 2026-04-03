@@ -184,6 +184,41 @@ typedef enum {
 static uint8_t mspPassthroughMode;
 static uint8_t mspPassthroughArgument;
 
+typedef enum {
+    PID_TUNER_REJECT_NONE = 0,
+    PID_TUNER_REJECT_ARMED = 1,
+    PID_TUNER_REJECT_COOLDOWN = 2,
+    PID_TUNER_REJECT_STEP_LIMIT = 3,
+    PID_TUNER_REJECT_OBSERVE_ONLY = 4
+} pidTunerRejectReason_e;
+
+typedef struct {
+    bool enabled;
+    bool observeOnly;
+    bool requireDisarmed;
+    uint8_t maxStepPerTerm;
+    uint16_t minApplyIntervalMs;
+    uint32_t lastApplyAtMs;
+    uint8_t lastRejectReason;
+    uint8_t applyCount;
+} pidTunerStatus_t;
+
+static pidTunerStatus_t pidTunerStatus = {
+    .enabled = false,
+    .observeOnly = true,
+    .requireDisarmed = true,
+    .maxStepPerTerm = 2,
+    .minApplyIntervalMs = 30000,
+    .lastApplyAtMs = 0,
+    .lastRejectReason = PID_TUNER_REJECT_NONE,
+    .applyCount = 0
+};
+
+static uint8_t pidAbsDelta(const uint8_t a, const uint8_t b)
+{
+    return (a > b) ? (a - b) : (b - a);
+}
+
 static serialPort_t *mspFindPassthroughSerialPort(void)
  {
     serialPortUsage_t *portUsage = NULL;
@@ -791,6 +826,17 @@ static bool mspFcProcessOutCommand(uint16_t cmdMSP, sbuf_t *dst, mspPostProcessF
         #ifdef USE_EZ_TUNE
             ezTuneUpdate();
         #endif
+        break;
+
+    case MSP2_INAV_PID_TUNER_STATUS:
+        sbufWriteU8(dst, pidTunerStatus.enabled ? 1 : 0);
+        sbufWriteU8(dst, pidTunerStatus.observeOnly ? 1 : 0);
+        sbufWriteU8(dst, pidTunerStatus.requireDisarmed ? 1 : 0);
+        sbufWriteU8(dst, pidTunerStatus.maxStepPerTerm);
+        sbufWriteU16(dst, pidTunerStatus.minApplyIntervalMs);
+        sbufWriteU32(dst, pidTunerStatus.lastApplyAtMs);
+        sbufWriteU8(dst, pidTunerStatus.lastRejectReason);
+        sbufWriteU8(dst, pidTunerStatus.applyCount);
         break;
 
     case MSP_PIDNAMES:
@@ -1999,16 +2045,73 @@ static mspResult_e mspFcProcessInCommand(uint16_t cmdMSP, sbuf_t *src)
 
     case MSP2_SET_PID:
         if (dataSize == PID_ITEM_COUNT * 4) {
+            pid8_t requestedPid[PID_ITEM_COUNT];
             for (int i = 0; i < PID_ITEM_COUNT; i++) {
-                pidBankMutable()->pid[i].P = sbufReadU8(src);
-                pidBankMutable()->pid[i].I = sbufReadU8(src);
-                pidBankMutable()->pid[i].D = sbufReadU8(src);
-                pidBankMutable()->pid[i].FF = sbufReadU8(src);
+                requestedPid[i].P = sbufReadU8(src);
+                requestedPid[i].I = sbufReadU8(src);
+                requestedPid[i].D = sbufReadU8(src);
+                requestedPid[i].FF = sbufReadU8(src);
             }
+
+            if (pidTunerStatus.enabled) {
+                const uint32_t nowMs = millis();
+                if (pidTunerStatus.observeOnly) {
+                    pidTunerStatus.lastRejectReason = PID_TUNER_REJECT_OBSERVE_ONLY;
+                    return MSP_RESULT_ERROR;
+                }
+                if (pidTunerStatus.requireDisarmed && ARMING_FLAG(ARMED)) {
+                    pidTunerStatus.lastRejectReason = PID_TUNER_REJECT_ARMED;
+                    return MSP_RESULT_ERROR;
+                }
+                if ((nowMs - pidTunerStatus.lastApplyAtMs) < pidTunerStatus.minApplyIntervalMs) {
+                    pidTunerStatus.lastRejectReason = PID_TUNER_REJECT_COOLDOWN;
+                    return MSP_RESULT_ERROR;
+                }
+
+                for (int i = 0; i < PID_ITEM_COUNT; i++) {
+                    if ((pidAbsDelta(pidBank()->pid[i].P, requestedPid[i].P) > pidTunerStatus.maxStepPerTerm) ||
+                        (pidAbsDelta(pidBank()->pid[i].I, requestedPid[i].I) > pidTunerStatus.maxStepPerTerm) ||
+                        (pidAbsDelta(pidBank()->pid[i].D, requestedPid[i].D) > pidTunerStatus.maxStepPerTerm) ||
+                        (pidAbsDelta(pidBank()->pid[i].FF, requestedPid[i].FF) > pidTunerStatus.maxStepPerTerm)) {
+                        pidTunerStatus.lastRejectReason = PID_TUNER_REJECT_STEP_LIMIT;
+                        return MSP_RESULT_ERROR;
+                    }
+                }
+            }
+
+            for (int i = 0; i < PID_ITEM_COUNT; i++) {
+                pidBankMutable()->pid[i].P = requestedPid[i].P;
+                pidBankMutable()->pid[i].I = requestedPid[i].I;
+                pidBankMutable()->pid[i].D = requestedPid[i].D;
+                pidBankMutable()->pid[i].FF = requestedPid[i].FF;
+            }
+
+            if (pidTunerStatus.enabled) {
+                pidTunerStatus.lastApplyAtMs = millis();
+                pidTunerStatus.lastRejectReason = PID_TUNER_REJECT_NONE;
+                pidTunerStatus.applyCount++;
+            }
+
             schedulePidGainsUpdate();
             navigationUsePIDs();
-        } else
+        } else {
             return MSP_RESULT_ERROR;
+        }
+        break;
+
+    case MSP2_INAV_SET_PID_TUNER_CONTROL:
+        if (dataSize == 5) {
+            pidTunerStatus.enabled = sbufReadU8(src) != 0;
+            pidTunerStatus.observeOnly = sbufReadU8(src) != 0;
+            pidTunerStatus.requireDisarmed = sbufReadU8(src) != 0;
+            pidTunerStatus.maxStepPerTerm = sbufReadU8(src);
+            pidTunerStatus.minApplyIntervalMs = sbufReadU8(src) * 1000U;
+            if (!pidTunerStatus.maxStepPerTerm) {
+                pidTunerStatus.maxStepPerTerm = 1;
+            }
+        } else {
+            return MSP_RESULT_ERROR;
+        }
         break;
 
     case MSP_SET_MODE_RANGE:

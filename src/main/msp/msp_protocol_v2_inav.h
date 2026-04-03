@@ -90,6 +90,8 @@
 #define MSP2_INAV_MISC2                         0x203A
 #define MSP2_INAV_LOGIC_CONDITIONS_SINGLE       0x203B
 #define MSP2_INAV_LOGIC_CONDITIONS_CONFIGURED   0x203C  // Returns 8-byte bitmask of non-default logic conditions
+#define MSP2_INAV_PID_TUNER_STATUS              0x203D
+#define MSP2_INAV_SET_PID_TUNER_CONTROL         0x203E
 
 #define MSP2_INAV_ESC_RPM                       0x2040
 #define MSP2_INAV_ESC_TELEM                     0x2041
